@@ -18,6 +18,13 @@ class MautrixImessage < Formula
 
   depends_on "cmake" => :build
   depends_on "go" => :build
+  # Runtime, for media conversion: macOS ships sips (HEIC->JPEG) and
+  # afconvert (CAF->M4A), but nothing that converts MOV/3GP video to MP4.
+  # Without ffmpeg the history importer leaves videos in a format no browser
+  # plays, and does so SILENTLY — it falls back to the system tools and
+  # reports no error. Declared here so the connector never installs half a
+  # converter.
+  depends_on "ffmpeg"
   depends_on :macos
 
   # mautrix-imessage pins a legacy mautrix-go (v0.16.x line) whose crypto
