@@ -15,7 +15,7 @@ class MautrixImessage < Formula
   version "2026.05.14"
   sha256 "7286820d1ef9642f7459581e823777f8bcf6888929666a8ab7d759c4ce5cf140"
   license "AGPL-3.0-or-later"
-  revision 1
+  revision 2
 
   depends_on "cmake" => :build
   depends_on "go" => :build
@@ -85,6 +85,83 @@ class MautrixImessage < Formula
       		return "iMessage"
       	}
       	return service
+      }
+    GO
+
+    # Double puppeting through the appservice token, so the owner's own
+    # messages keep their real date. Synapse honours `?ts=` only when the
+    # requester IS an appservice (rest/client/room.py). Upstream, the literal
+    # `login_shared_secret: appservice` does an m.login.application_service
+    # login and then sends with the resulting USER token: `ts` is dropped and
+    # every message caught up after an outage is dated at catch-up time
+    # (contacts' messages, sent by ghosts with the AS token, keep theirs).
+    # This legacy mautrix-go (v0.16) predates the `as_token:` double-puppet
+    # mode of newer bridges, so add it here: with `appservice` (registration
+    # token) or `as_token:<token>`, the double puppet client uses the AS token
+    # + `?user_id=` and never logs in. Requires the owner to be in the
+    # registration's users namespace (exclusive: false) — exactly what the
+    # appservice login already required. The echo marker
+    # (fi.mau.double_puppet_source, IsCustomPuppet) is untouched.
+    inreplace "custompuppet.go" do |s|
+      s.sub! "\tloginSecret := user.bridge.Config.Bridge.LoginSharedSecret\n",
+             "\tloginSecret := user.bridge.Config.Bridge.LoginSharedSecret\n" \
+             "\tif _, ok := user.masqueradeToken(); ok {\n" \
+             "\t\treturn user.useMasquerade()\n" \
+             "\t}\n"
+      s.sub! "\tclient, err := user.bridge.AS.NewExternalMautrixClient(user.MXID, user.AccessToken, " \
+             "user.bridge.Config.Bridge.DoublePuppetServerURL)\n",
+             "\tclient, err := user.newDoublePuppetClient()\n"
+    end
+    (buildpath/"custompuppet_masquerade.go").write <<~GO
+      package main
+
+      import (
+      	"strings"
+
+      	"maunium.net/go/mautrix"
+      )
+
+      // masqueradeSentinel is stored as the user's access token in
+      // masquerade mode: never a credential, only "double puppeting is
+      // configured" for whoever reads the database (the history importer).
+      const masqueradeSentinel = "appservice"
+
+      // masqueradeToken returns the appservice token the double puppet acts
+      // with, if login_shared_secret selects masquerade mode.
+      func (user *User) masqueradeToken() (string, bool) {
+      	secret := user.bridge.Config.Bridge.LoginSharedSecret
+      	if secret == "appservice" {
+      		return user.bridge.AS.Registration.AppToken, true
+      	}
+      	if token, ok := strings.CutPrefix(secret, "as_token:"); ok && token != "" {
+      		return token, true
+      	}
+      	return "", false
+      }
+
+      // useMasquerade replaces the shared-secret login: nothing to log in to.
+      func (user *User) useMasquerade() error {
+      	user.log.Debugln("Double puppeting with the appservice token (masquerade, ?user_id=)")
+      	if user.AccessToken != masqueradeSentinel {
+      		user.AccessToken = masqueradeSentinel
+      		user.Update()
+      	}
+      	return nil
+      }
+
+      // newDoublePuppetClient is the double puppet's Matrix client: the
+      // stored user token, or in masquerade mode the appservice token with
+      // ?user_id= so that Synapse honours ?ts= on caught-up messages.
+      func (user *User) newDoublePuppetClient() (*mautrix.Client, error) {
+      	client, err := user.bridge.AS.NewExternalMautrixClient(user.MXID, user.AccessToken, user.bridge.Config.Bridge.DoublePuppetServerURL)
+      	if err != nil {
+      		return nil, err
+      	}
+      	if token, ok := user.masqueradeToken(); ok {
+      		client.AccessToken = token
+      		client.SetAppServiceUserID = true
+      	}
+      	return client, nil
       }
     GO
 
