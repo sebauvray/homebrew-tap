@@ -15,6 +15,7 @@ class MautrixImessage < Formula
   version "2026.05.14"
   sha256 "7286820d1ef9642f7459581e823777f8bcf6888929666a8ab7d759c4ce5cf140"
   license "AGPL-3.0-or-later"
+  revision 1
 
   depends_on "cmake" => :build
   depends_on "go" => :build
@@ -61,6 +62,31 @@ class MautrixImessage < Formula
       system "cmake", "--build", "build"
       system "cmake", "--install", "build"
     end
+
+    # Recent macOS (27) merges iMessage and SMS chats under the "any" service
+    # (chat GUIDs "any;-;+33…"). When Messages.app has no such chat loaded,
+    # `send … to chat id` fails with -1728 and the bridge falls back to
+    # scripts doing `1st service whose service type = <service>` — with
+    # "any", which is no AppleScript constant (-1700), so the send is lost.
+    # Map "any" to iMessage for those fallbacks: the buddy lookup then works.
+    inreplace "imessage/mac/send.go" do |s|
+      s.gsub! "fmt.Sprintf(fallbackScript1, identifier.Service)",
+              "fmt.Sprintf(fallbackScript1, scriptService(identifier.Service))"
+      s.gsub! "fmt.Sprintf(fallbackScript2, identifier.Service)",
+              "fmt.Sprintf(fallbackScript2, scriptService(identifier.Service))"
+    end
+    (buildpath/"imessage/mac/service_any.go").write <<~GO
+      package mac
+
+      // scriptService maps a chat GUID service to an AppleScript service
+      // type constant: "any" (merged iMessage/SMS chats) is not one.
+      func scriptService(service string) string {
+      	if service == "any" {
+      		return "iMessage"
+      	}
+      	return service
+      }
+    GO
 
     ENV.append "CGO_CFLAGS", "-I#{olm_prefix}/include"
     ENV.append "CGO_LDFLAGS", "-L#{olm_prefix}/lib"
