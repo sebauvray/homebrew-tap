@@ -15,7 +15,7 @@ class MautrixImessage < Formula
   version "2026.05.14"
   sha256 "7286820d1ef9642f7459581e823777f8bcf6888929666a8ab7d759c4ce5cf140"
   license "AGPL-3.0-or-later"
-  revision 2
+  revision 3
 
   depends_on "cmake" => :build
   depends_on "go" => :build
@@ -162,6 +162,135 @@ class MautrixImessage < Formula
       		client.SetAppServiceUserID = true
       	}
       	return client, nil
+      }
+    GO
+
+    # Report failed sends. The Mac connector treats a message as sent as soon
+    # as Messages.app writes its row (the "echo"); when iMessage later refuses
+    # it (red "!" in Messages, `message.error` set), nothing reaches Matrix:
+    # the client keeps showing it as sent and the message silently never
+    # leaves the Mac. Upstream already turns a "failed" SendMessageStatus into
+    # an error notice + a permanent-failure send status, but the Mac
+    # connector's MessageStatusChan() returns nil. Watch chat.db on each
+    # fsevent for our own messages whose `error` became non-zero and emit it.
+    inreplace "imessage/mac/database.go",
+              "\tReadReceipts                 chan *imessage.ReadReceipt\n",
+              "\tReadReceipts                 chan *imessage.ReadReceipt\n" \
+              "\tsendFailures                 *sendFailureWatcher\n"
+    inreplace "imessage/mac/messages.go" do |s|
+      s.sub! "\tmac.ReadReceipts = make(chan *imessage.ReadReceipt)\n",
+             "\tmac.ReadReceipts = make(chan *imessage.ReadReceipt)\n" \
+             "\tmac.sendFailures = newSendFailureWatcher(mac.chatDB, mac.log)\n"
+      s.sub! "func (mac *macOSDatabase) MessageStatusChan() <-chan *imessage.SendMessageStatus {\n\treturn nil\n}",
+             "func (mac *macOSDatabase) MessageStatusChan() <-chan *imessage.SendMessageStatus {\n" \
+             "\treturn mac.sendFailures.channel()\n}"
+      s.sub! "\t\t\t\tfor _, receipt := range newReceipts {\n\t\t\t\t\tmac.ReadReceipts <- receipt\n\t\t\t\t}\n",
+             "\t\t\t\tfor _, receipt := range newReceipts {\n\t\t\t\t\tmac.ReadReceipts <- receipt\n\t\t\t\t}\n" \
+             "\t\t\t\tmac.sendFailures.check()\n"
+    end
+    (buildpath/"imessage/mac/send_failures.go").write <<~GO
+      package mac
+
+      import (
+      	"database/sql"
+      	"fmt"
+      	"time"
+
+      	log "maunium.net/go/maulogger/v2"
+
+      	"go.mau.fi/mautrix-imessage/imessage"
+      )
+
+      // Own messages whose send failed (red "!" in Messages.app). Bounded by
+      // ROWID (cheap range scan on the primary key) to rows written since the
+      // bridge started, and by date to the last day: older failures are not
+      // news, and a restart does not re-report them.
+      const failedSendsQuery = `
+      SELECT message.guid, chat.guid, message.error
+      FROM message
+      JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
+      JOIN chat              ON chat_message_join.chat_id = chat.ROWID
+      WHERE message.ROWID > $1 AND message.is_from_me = 1 AND message.error <> 0 AND message.date > $2
+      `
+
+      const sendFailureWindow = 24 * time.Hour
+
+      // sendFailureWatcher turns failed sends in chat.db into "failed"
+      // SendMessageStatus events. A nil watcher (query could not be
+      // prepared) is valid and does nothing.
+      type sendFailureWatcher struct {
+      	log      log.Logger
+      	query    *sql.Stmt
+      	minRowID int64
+      	reported map[string]int64 // message GUID -> error code already reported
+      	statuses chan *imessage.SendMessageStatus
+      }
+
+      func newSendFailureWatcher(db *sql.DB, logger log.Logger) *sendFailureWatcher {
+      	query, err := db.Prepare(failedSendsQuery)
+      	if err != nil {
+      		logger.Warnln("Failed to prepare failed sends query, send failures won't be reported:", err)
+      		return nil
+      	}
+      	var minRowID sql.NullInt64
+      	if err = db.QueryRow("SELECT MAX(ROWID) FROM message").Scan(&minRowID); err != nil {
+      		logger.Warnln("Failed to read last message row ID, send failures won't be reported:", err)
+      		return nil
+      	}
+      	return &sendFailureWatcher{
+      		log:      logger,
+      		query:    query,
+      		minRowID: minRowID.Int64,
+      		reported: make(map[string]int64),
+      		statuses: make(chan *imessage.SendMessageStatus, 32),
+      	}
+      }
+
+      func (w *sendFailureWatcher) channel() <-chan *imessage.SendMessageStatus {
+      	if w == nil {
+      		return nil
+      	}
+      	return w.statuses
+      }
+
+      // check is called from the fsevent handler, under its lock.
+      func (w *sendFailureWatcher) check() {
+      	if w == nil {
+      		return
+      	}
+      	since := time.Now().Add(-sendFailureWindow).UnixNano() - imessage.AppleEpoch.UnixNano()
+      	rows, err := w.query.Query(w.minRowID, since)
+      	if err != nil {
+      		w.log.Warnln("Error querying failed sends:", err)
+      		return
+      	}
+      	defer rows.Close()
+      	for rows.Next() {
+      		var guid, chatGUID string
+      		var code int64
+      		if err = rows.Scan(&guid, &chatGUID, &code); err != nil {
+      			w.log.Warnln("Error scanning failed send:", err)
+      			return
+      		}
+      		if w.reported[guid] == code {
+      			continue
+      		}
+      		status := &imessage.SendMessageStatus{
+      			GUID:       guid,
+      			ChatGUID:   chatGUID,
+      			Status:     "failed",
+      			Service:    imessage.ParseIdentifier(chatGUID).Service,
+      			StatusCode: fmt.Sprintf("%d", code),
+      			Message:    "Non distribué : Messages sur le Mac n'a pas pu l'envoyer. Renvoie-le depuis Messages (en SMS si besoin).",
+      		}
+      		select {
+      		case w.statuses <- status:
+      			w.reported[guid] = code
+      			w.log.Infofln("Send of %s in %s failed in Messages.app (error %d), reporting it", guid, chatGUID, code)
+      		default:
+      			w.log.Warnln("Message status buffer is full, will retry failed send", guid)
+      		}
+      	}
       }
     GO
 
