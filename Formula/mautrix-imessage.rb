@@ -15,7 +15,7 @@ class MautrixImessage < Formula
   version "2026.05.14"
   sha256 "7286820d1ef9642f7459581e823777f8bcf6888929666a8ab7d759c4ce5cf140"
   license "AGPL-3.0-or-later"
-  revision 3
+  revision 4
 
   depends_on "cmake" => :build
   depends_on "go" => :build
@@ -33,6 +33,18 @@ class MautrixImessage < Formula
   # dropped the libolm formula (upstream olm is unmaintained), so olm is
   # vendored here and linked STATICALLY: the installed binary has no
   # runtime dependency on it.
+  # Resend a failed message as SMS from Matrix: react with 📱 on it, or
+  # `!im sms` (in reply to it, else the chat's latest failed message).
+  # Messages.app has no scriptable "Send as Text Message": the text and each
+  # attachment are sent again on the SMS account (Text Message Forwarding
+  # through the iPhone). The SMS echo takes over the failed message's Matrix
+  # event (dedup entry pointing at it, old bridge row dropped since
+  # message.mxid is UNIQUE): no second message in the room. DMs with a phone
+  # number only. NOT verified end to end yet: if Messages files the SMS in a
+  # separate "SMS;-;+33…" chat instead of the merged "any;-;+33…", it lands
+  # in a new room and the failed message is not replaced.
+  patch :DATA
+
   resource "libolm" do
     url "https://gitlab.matrix.org/matrix-org/olm/-/archive/3.2.16/olm-3.2.16.tar.gz"
     sha256 "1e90f9891009965fd064be747616da46b232086fe270b77605ec9bda34272a68"
@@ -332,3 +344,319 @@ class MautrixImessage < Formula
     assert_match "as_token", (testpath/"registration.yaml").read
   end
 end
+
+__END__
+diff --git a/commands.go b/commands.go
+index ee37236..66b46de 100644
+--- a/commands.go
++++ b/commands.go
+@@ -41,6 +41,7 @@ func (br *IMBridge) RegisterCommands() {
+ 		cmdPM,
+ 		cmdSearchContacts,
+ 		cmdRefreshContacts,
++		cmdResendSMS,
+ 	)
+ }
+ 
+diff --git a/imessage/mac/sms_resend.go b/imessage/mac/sms_resend.go
+new file mode 100644
+index 0000000..466ebfa
+--- /dev/null
++++ b/imessage/mac/sms_resend.go
+@@ -0,0 +1,101 @@
++package mac
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"go.mau.fi/mautrix-imessage/imessage"
++)
++
++// Same shape as upstream's sendMessageBuddy fallback (buddy == participant,
++// service == account), but on the SMS account: the message goes through the
++// iPhone's Text Message Forwarding, like "Send as Text Message" in Messages.
++const sendTextAsSMS = `
++on run {targetHandle, messageText}
++	tell application "Messages"
++		set smsAccount to 1st account whose service type = SMS
++		set theParticipant to a reference to participant targetHandle of smsAccount
++		send messageText to theParticipant
++	end tell
++end run
++`
++
++const sendFileAsSMS = `
++on run {targetHandle, filePath}
++	tell application "Messages"
++		set smsAccount to 1st account whose service type = SMS
++		set theParticipant to a reference to participant targetHandle of smsAccount
++		send filePath as POSIX file to theParticipant
++	end tell
++end run
++`
++
++// Own failed message in a chat: the given one, or the latest one.
++const failedOwnMessageQuery = `
++SELECT message.guid FROM message
++JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
++JOIN chat              ON chat_message_join.chat_id = chat.ROWID
++WHERE chat.guid = $1 AND message.is_from_me = 1 AND message.error <> 0
++  AND ($2 = '' OR message.guid = $2)
++ORDER BY message.date DESC LIMIT 1
++`
++
++var ErrNotFailed = errors.New("ce message n'est pas en échec dans Messages")
++
++// SMSResendCandidate finds the failed message to resend (messageGUID, or
++// the latest failed one when empty) and the key the echo will be matched
++// on. Nothing is sent.
++func (mac *macOSDatabase) SMSResendCandidate(chatGUID, messageGUID string) (*imessage.Message, string, error) {
++	ident := imessage.ParseIdentifier(chatGUID)
++	if ident.IsGroup {
++		return nil, "", errors.New("renvoi en SMS : discussions de groupe non prises en charge")
++	} else if !strings.HasPrefix(ident.LocalID, "+") {
++		return nil, "", errors.New("renvoi en SMS : le correspondant n'est pas un numéro de téléphone")
++	}
++	var guid string
++	if err := mac.chatDB.QueryRow(failedOwnMessageQuery, chatGUID, messageGUID).Scan(&guid); err != nil {
++		return nil, "", ErrNotFailed
++	}
++	res, err := mac.singleMessageQuery.Query(guid)
++	if err != nil {
++		return nil, "", fmt.Errorf("lecture du message %s : %w", guid, err)
++	}
++	msgs, err := mac.scanMessages(res)
++	if err != nil || len(msgs) == 0 {
++		return nil, "", fmt.Errorf("lecture du message %s : %v", guid, err)
++	}
++	msg := msgs[0] // upstream GetMessage reads msgs[1]: wrong for a single row
++	key := msg.Text
++	if len(msg.Attachments) == 1 {
++		key = msg.Attachments[0].FileName
++	}
++	return msg, strings.TrimSpace(key), nil
++}
++
++// SendAsSMS sends the message's text and attachments again, on the SMS
++// account, to the chat's phone number.
++func (mac *macOSDatabase) SendAsSMS(msg *imessage.Message) error {
++	handle := imessage.ParseIdentifier(msg.ChatGUID).LocalID
++	if strings.TrimSpace(msg.Text) != "" {
++		if err := runOsascriptWithoutOutput(sendTextAsSMS, handle, msg.Text); err != nil {
++			return fmt.Errorf("envoi du texte en SMS : %w", err)
++		}
++	}
++	for _, att := range msg.Attachments {
++		path := att.PathOnDisk
++		if strings.HasPrefix(path, "~/") {
++			home, err := os.UserHomeDir()
++			if err != nil {
++				return err
++			}
++			path = filepath.Join(home, path[2:])
++		}
++		if err := runOsascriptWithoutOutput(sendFileAsSMS, handle, path); err != nil {
++			return fmt.Errorf("envoi de %s en SMS : %w", att.FileName, err)
++		}
++	}
++	return nil
++}
+diff --git a/imessage/mac/sms_resend_test.go b/imessage/mac/sms_resend_test.go
+new file mode 100644
+index 0000000..7d828f7
+--- /dev/null
++++ b/imessage/mac/sms_resend_test.go
+@@ -0,0 +1,37 @@
++package mac
++
++import (
++	"database/sql"
++	"testing"
++)
++
++func TestFailedOwnMessageQuery(t *testing.T) {
++	db, err := sql.Open("sqlite3", ":memory:")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, q := range []string{
++		`CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, is_from_me INT, error INT, date INT)`,
++		`CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT)`,
++		`CREATE TABLE chat_message_join (chat_id INT, message_id INT)`,
++		`INSERT INTO chat VALUES (1, 'any;-;+33600000000'), (2, 'any;-;+33611111111')`,
++		`INSERT INTO message VALUES (1,'A',1,22,10),(2,'B',1,0,20),(3,'C',1,22,30),(4,'D',0,22,40),(5,'E',1,22,50)`,
++		`INSERT INTO chat_message_join VALUES (1,1),(1,2),(1,3),(1,4),(2,5)`,
++	} {
++		if _, err = db.Exec(q); err != nil {
++			t.Fatal(q, err)
++		}
++	}
++	get := func(msg string) string {
++		var guid string
++		if err := db.QueryRow(failedOwnMessageQuery, "any;-;+33600000000", msg).Scan(&guid); err != nil {
++			return "none"
++		}
++		return guid
++	}
++	for in, want := range map[string]string{"": "C", "A": "A", "B": "none", "D": "none", "E": "none"} {
++		if got := get(in); got != want {
++			t.Errorf("%q: got %s, want %s", in, got, want)
++		}
++	}
++}
+diff --git a/portal.go b/portal.go
+index 8afb890..071e9fc 100644
+--- a/portal.go
++++ b/portal.go
+@@ -229,6 +229,8 @@ func (br *IMBridge) NewPortal(dbPortal *database.Portal) *Portal {
+ type SentMessage struct {
+ 	EventID   id.EventID
+ 	Timestamp time.Time
++	// ReplacesGUID: the failed message this echo (an SMS resend) replaces.
++	ReplacesGUID string
+ }
+ 
+ type Portal struct {
+@@ -1510,6 +1512,9 @@ func (portal *Portal) HandleMatrixTyping(userIDs []id.UserID) {
+ }
+ 
+ func (portal *Portal) HandleMatrixReaction(evt *event.Event) {
++	if portal.handleSMSResendReaction(evt) {
++		return
++	}
+ 	if !portal.bridge.IM.Capabilities().SendTapbacks {
+ 		portal.sendUnsupportedCheckpoint(evt, status.MsgStepRemote, errors.New("reactions are not supported"))
+ 		return
+@@ -1688,6 +1693,9 @@ func (portal *Portal) isDuplicate(dbMessage *database.Message, msg *imessage.Mes
+ 		if !dedup.Timestamp.Before(msg.Time) {
+ 			portal.log.Warnfln("Echo for Matrix message %s has lower timestamp than expected (message: %s, expected: %s)", msg.Time.Unix(), dedup.Timestamp.Unix())
+ 		}
++		if dedup.ReplacesGUID != "" {
++			portal.forgetReplacedMessage(dedup.ReplacesGUID)
++		}
+ 		dbMessage.MXID = dedup.EventID
+ 		dbMessage.Timestamp = msg.Time.UnixMilli()
+ 		dbMessage.Insert(nil)
+diff --git a/sms_resend.go b/sms_resend.go
+new file mode 100644
+index 0000000..b9d2016
+--- /dev/null
++++ b/sms_resend.go
+@@ -0,0 +1,113 @@
++package main
++
++import (
++	"fmt"
++	"strings"
++	"time"
++
++	"maunium.net/go/mautrix/bridge/commands"
++	"maunium.net/go/mautrix/event"
++	"maunium.net/go/mautrix/id"
++
++	"go.mau.fi/mautrix-imessage/imessage"
++)
++
++// Connectors that can resend a failed message as SMS (the Mac one).
++type smsResender interface {
++	SMSResendCandidate(chatGUID, messageGUID string) (*imessage.Message, string, error)
++	SendAsSMS(msg *imessage.Message) error
++}
++
++// Reacting with this on a failed message resends it as SMS. Not a tapback
++// emoji (imessage.TapbackFromEmoji), so it never reaches the contact.
++const smsResendReaction = "📱"
++
++// resendAsSMS resends the failed message behind target (or, when target is
++// not a bridged message, the latest failed one of this chat). The SMS echo
++// takes over the original event: no second message appears in Matrix.
++func (portal *Portal) resendAsSMS(target id.EventID) error {
++	resender, ok := portal.bridge.IM.(smsResender)
++	if !ok {
++		return fmt.Errorf("ce connecteur ne sait pas renvoyer en SMS")
++	}
++	var messageGUID string
++	if target != "" {
++		if dbMsg := portal.bridge.DB.Message.GetByMXID(target); dbMsg != nil && dbMsg.PortalGUID == portal.GUID {
++			messageGUID = dbMsg.GUID
++		}
++	}
++	msg, key, err := resender.SMSResendCandidate(portal.GUID, messageGUID)
++	if err != nil {
++		return err
++	}
++	dbMsg := portal.bridge.DB.Message.GetLastByGUID(portal.GUID, msg.GUID)
++	if dbMsg != nil && key != "" {
++		portal.addResendDedup(dbMsg.MXID, key, msg.GUID)
++	}
++	if err = resender.SendAsSMS(msg); err != nil {
++		portal.messageDedupLock.Lock()
++		delete(portal.messageDedup, key)
++		portal.messageDedupLock.Unlock()
++		return err
++	}
++	portal.log.Infofln("Resent failed message %s as SMS", msg.GUID)
++	return nil
++}
++
++func (portal *Portal) addResendDedup(eventID id.EventID, key, oldGUID string) {
++	if portal.messageDedup == nil {
++		return
++	}
++	portal.messageDedupLock.Lock()
++	portal.messageDedup[key] = SentMessage{EventID: eventID, Timestamp: time.Now().Add(-10 * time.Second), ReplacesGUID: oldGUID}
++	portal.messageDedupLock.Unlock()
++}
++
++// forgetReplacedMessage drops the failed row so the SMS echo can take its
++// Matrix event (message.mxid is UNIQUE).
++func (portal *Portal) forgetReplacedMessage(guid string) {
++	if _, err := portal.bridge.DB.Exec("DELETE FROM message WHERE portal_guid=$1 AND guid=$2", portal.GUID, guid); err != nil {
++		portal.log.Warnfln("Failed to forget replaced message %s: %v", guid, err)
++	}
++}
++
++func (portal *Portal) sendResendNotice(text string) {
++	intent := portal.bridge.Bot
++	if !portal.Encrypted {
++		intent = portal.MainIntent()
++	}
++	_, _ = portal.sendMessage(intent, event.EventMessage, event.MessageEventContent{MsgType: event.MsgNotice, Body: text}, map[string]interface{}{}, 0)
++}
++
++// handleSMSResendReaction is called before tapback handling.
++func (portal *Portal) handleSMSResendReaction(evt *event.Event) bool {
++	reaction, ok := evt.Content.Parsed.(*event.ReactionEventContent)
++	if !ok || strings.TrimSuffix(reaction.RelatesTo.Key, "️") != smsResendReaction {
++		return false
++	}
++	if err := portal.resendAsSMS(reaction.RelatesTo.EventID); err != nil {
++		portal.sendResendNotice("⚠ Renvoi en SMS impossible : " + err.Error())
++	} else {
++		portal.sendResendNotice("📱 Renvoyé en SMS.")
++	}
++	return true
++}
++
++var cmdResendSMS = &commands.FullHandler{
++	Func: wrapCommand(fnResendSMS),
++	Name: "sms",
++	Help: commands.HelpMeta{
++		Section:     HelpSectionManagingPortals,
++		Description: "Renvoie en SMS le message en échec auquel on répond (sinon le dernier en échec).",
++	},
++	RequiresPortal: true,
++	RequiresLogin:  false,
++}
++
++func fnResendSMS(ce *WrappedCommandEvent) {
++	if err := ce.Portal.resendAsSMS(ce.ReplyTo); err != nil {
++		ce.Reply("Renvoi en SMS impossible : %s", err)
++	} else {
++		ce.Reply("📱 Renvoyé en SMS.")
++	}
++}
